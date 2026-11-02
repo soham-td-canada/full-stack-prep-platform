@@ -83,6 +83,8 @@ describe("answer submission", () => {
     fireEvent.click(screen.getByRole("button", { name: "Back to dashboard" }));
     expect(loadProgress(window.localStorage).attempts).toHaveLength(0);
     fireEvent.click(screen.getByRole("button", { name: "Debug It" }));
+    fireEvent.click(screen.getByRole("button", { name: "End current session" }));
+    fireEvent.click(screen.getByRole("button", { name: "Debug It" }));
     fireEvent.change(screen.getByLabelText("Your answer"), { target: { value: "Need to consider the loop bound." } });
     fireEvent.click(screen.getByRole("button", { name: "Submit answer" }));
     fireEvent.click(screen.getByRole("button", { name: "Back to dashboard" }));
@@ -125,6 +127,18 @@ describe("dashboard and weakness review", () => {
     fireEvent.click(screen.getByRole("button", { name: "Resume saved question" }));
     expect(screen.getByLabelText("X")).toHaveValue("My unfinished response");
     expect(loadProgress(window.localStorage).attempts).toHaveLength(0);
+  });
+  it("never silently discards a paused answer when another mode is selected", () => {
+    render(<DrillApp />);
+    fireEvent.click(screen.getByRole("button", { name: "Concept Reconstruction" }));
+    fireEvent.change(screen.getByLabelText("X"), { target: { value: "Saved before switching" } });
+    fireEvent.click(screen.getByRole("button", { name: "Back to dashboard" }));
+    const before = loadProgress(window.localStorage);
+    fireEvent.click(screen.getByRole("button", { name: "Debug It" }));
+    expect(screen.getByRole("heading", { name: "Session already in progress" })).toBeInTheDocument();
+    expect(loadProgress(window.localStorage).resume).toEqual(before.resume);
+    fireEvent.click(screen.getByRole("button", { name: "Resume active session" }));
+    expect(screen.getByLabelText("X")).toHaveValue("Saved before switching");
   });
   it("stops a completed session instead of automatically starting another", () => {
     let progress = startSession(emptyProgress(), 10, questions);

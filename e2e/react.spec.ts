@@ -98,7 +98,7 @@ test("structured drafts survive refresh; mistakes generate targeted review witho
   expect(saved.attempts[0].finalResult).toBe("miss");
   expect(saved.reviews["react-ref"].successful).toBe(true);
   await page.reload();
-  await expect(page.getByRole("region", { name: "REACT READINESS" }).getByText("BUILDING READINESS", { exact: true })).toBeVisible();
+  await expect(page.getByRole("region", { name: "REACT READINESS" }).getByText("IN PROGRESS", { exact: true })).toBeVisible();
 });
 
 test("a final realistic review unlocks readiness with optional depth unfinished", async ({ page }) => {

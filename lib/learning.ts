@@ -58,7 +58,16 @@ export function allowedMistakeTags(question: Question) {
 
 export const accuracy = (attempts: Attempt[]) =>
   attempts.length ? attempts.reduce((sum, a) => sum + (a.score ?? (a.finalResult === "correct" ? 1 : a.finalResult === "partial" ? 0.5 : 0)), 0) / attempts.length : 0;
-function latestUniqueQuestions(attempts: Attempt[], limit = Number.POSITIVE_INFINITY) {
+const questionIndexes = new WeakMap<Question[], Map<string, Question>>();
+function questionIndex(bank: Question[]) {
+  let index = questionIndexes.get(bank);
+  if (!index) {
+    index = new Map(bank.map((question) => [question.id, question]));
+    questionIndexes.set(bank, index);
+  }
+  return index;
+}
+export function latestUniqueQuestions(attempts: Attempt[], limit = Number.POSITIVE_INFINITY) {
   const seen = new Set<string>();
   const latest: Attempt[] = [];
   for (let index = attempts.length - 1; index >= 0 && latest.length < limit; index--) {
@@ -69,8 +78,8 @@ function latestUniqueQuestions(attempts: Attempt[], limit = Number.POSITIVE_INFI
   }
   return latest.reverse();
 }
-const isCore = (a: Attempt, bank: Question[]) => {
-  const question = bank.find((q) => q.id === a.questionId);
+export const isCore = (a: Attempt, bank: Question[]) => {
+  const question = questionIndex(bank).get(a.questionId);
   return question !== undefined && question.mode !== "legacyConcept" &&
     (question.depth !== "optional" || (a.finalResult !== "correct" && a.mistakeTags.length > 0));
 };
@@ -113,9 +122,9 @@ export function mastery(progress: Progress, concept: Concept, bank: Question[] =
   const varied = new Set(attempts.map((a) => a.questionId)).size >= 2;
   const recurring = unresolvedTags(progress, concept, bank);
   const weak = (recent.length >= 3 && accuracy(recent) < 0.7) || recurring.length > 0;
-  const reconstruction = attempts.some((a) => bank.find((q) => q.id === a.questionId)?.mode === conceptualMode && a.finalResult === "correct");
+  const reconstruction = attempts.some((a) => questionIndex(bank).get(a.questionId)?.mode === conceptualMode && a.finalResult === "correct");
   const practical = attempts.some((a) => {
-    const mode = bank.find((q) => q.id === a.questionId)?.mode;
+    const mode = questionIndex(bank).get(a.questionId)?.mode;
     return mode !== undefined && mode !== conceptualMode && mode !== "legacyConcept" && a.finalResult === "correct";
   });
   const isReview = concept === "reactReview";
@@ -128,6 +137,20 @@ export function mastery(progress: Progress, concept: Concept, bank: Question[] =
     status: weak ? "Weak" : ready ? "Ready" : total >= 2 ? "Almost Ready" : "Learning",
   };
 }
+
+export const defaultPracticeThresholds = {
+  minimumCoreQuestions: 20,
+  recentCoreWindow: 30,
+  minimumRecentAccuracy: 0.82,
+  minimumMediumQuestions: 6,
+  minimumMediumDistinct: 3,
+  minimumMediumAccuracy: 0.8,
+  minimumHardQuestions: 3,
+  minimumHardDistinct: 2,
+  minimumDebugQuestions: 3,
+  minimumDebugDistinct: 2,
+  minimumDebugAccuracy: 0.7,
+};
 
 export function readiness(progress: Progress, bank: Question[], config: ReadinessConfig = {
   concepts: [...new Set(bank.flatMap((question) => question.concepts))],
@@ -145,6 +168,7 @@ export function readiness(progress: Progress, bank: Question[], config: Readines
     label: "20. Demonstrate review judgment: 3 distinct reviews, including 2 realistic reviews at 80%, with no fundamental miss",
   } : undefined,
 }) {
+  const thresholds = config.practiceThresholds ?? defaultPracticeThresholds;
   const subjectConcepts = config.concepts;
   const mustDo: { id: string; label: string; concept?: Concept }[] = [];
   const states = subjectConcepts.map((concept) => {
@@ -161,19 +185,27 @@ export function readiness(progress: Progress, bank: Question[], config: Readines
     return state;
   });
   const core = progress.attempts.filter((a) => isCore(a, bank));
-  const recent = latestUniqueQuestions(core.slice(-30), 30);
+  const recent = latestUniqueQuestions(core.slice(-Math.max(30, thresholds.recentCoreWindow)),
+    thresholds.recentCoreWindow);
   const medium = latestUniqueQuestions(core.filter((a) => a.difficulty === "medium").slice(-10), 10);
   const hard = latestUniqueQuestions(core.filter((a) => a.difficulty === "hard").slice(-10), 10);
-  const debug = latestUniqueQuestions(core.filter((a) => bank.find((q) => q.id === a.questionId)?.mode === "debug").slice(-6), 6);
-  if (recent.length < 20 || accuracy(recent) < 0.82) mustDo.push({
-    id: "recent", label: recent.length < 20 ? `${20 - recent.length} more distinct core questions` : "Recent core accuracy: aim for 82%, not 100%",
+  const debug = latestUniqueQuestions(core.filter((a) => questionIndex(bank).get(a.questionId)?.mode === "debug").slice(-6), 6);
+  if (recent.length < thresholds.minimumCoreQuestions || accuracy(recent) < thresholds.minimumRecentAccuracy) mustDo.push({
+    id: "recent", label: recent.length < thresholds.minimumCoreQuestions
+      ? `${thresholds.minimumCoreQuestions - recent.length} more distinct core questions`
+      : `Recent core accuracy: aim for ${Math.round(thresholds.minimumRecentAccuracy * 100)}%, not 100%`,
   });
-  if (medium.length < 6 || new Set(medium.map((a) => a.questionId)).size < 3 || accuracy(medium) < 0.8)
-    mustDo.push({ id: "medium", label: "Handle medium questions consistently (6 distinct questions, 3 variants, 80%)" });
-  if (hard.length < 3 || new Set(hard.map((a) => a.questionId)).size < 2)
-    mustDo.push({ id: "hard", label: "Attempt 3 core hard questions across 2 variants to expose gaps; passing all is not required" });
-  if (debug.length < 3 || new Set(debug.map((a) => a.questionId)).size < 2 || accuracy(debug) < 0.7)
-    mustDo.push({ id: "debug", label: "Complete debugging/code reasoning: 3 distinct questions across 2 variants with 70% accuracy" });
+  if (medium.length < thresholds.minimumMediumQuestions ||
+      new Set(medium.map((a) => a.questionId)).size < thresholds.minimumMediumDistinct ||
+      accuracy(medium) < thresholds.minimumMediumAccuracy)
+    mustDo.push({ id: "medium", label: `Handle medium questions consistently (${thresholds.minimumMediumQuestions} distinct questions, ${thresholds.minimumMediumDistinct} variants, ${Math.round(thresholds.minimumMediumAccuracy * 100)}%)` });
+  if (hard.length < thresholds.minimumHardQuestions ||
+      new Set(hard.map((a) => a.questionId)).size < thresholds.minimumHardDistinct)
+    mustDo.push({ id: "hard", label: `Attempt ${thresholds.minimumHardQuestions} core hard questions across ${thresholds.minimumHardDistinct} variants to expose gaps; passing all is not required` });
+  if (debug.length < thresholds.minimumDebugQuestions ||
+      new Set(debug.map((a) => a.questionId)).size < thresholds.minimumDebugDistinct ||
+      accuracy(debug) < thresholds.minimumDebugAccuracy)
+    mustDo.push({ id: "debug", label: `Complete debugging: ${thresholds.minimumDebugQuestions} distinct questions across ${thresholds.minimumDebugDistinct} variants with ${Math.round(thresholds.minimumDebugAccuracy * 100)}% accuracy` });
   const latestResults = new Map(latestUniqueQuestions(progress.attempts).map((attempt) =>
     [attempt.questionId, attempt.finalResult]));
   const completedImplementations = bank.filter((q) =>
@@ -186,10 +218,10 @@ export function readiness(progress: Progress, bank: Question[], config: Readines
   const reviewGate = config.reviewGate;
   if (reviewGate) {
     const reviews = latestUniqueQuestions(core.filter((attempt) =>
-      bank.find((question) => question.id === attempt.questionId)?.mode === reviewGate.mode)
+      questionIndex(bank).get(attempt.questionId)?.mode === reviewGate.mode)
       .slice(-reviewGate.minimumReviews * 2), reviewGate.minimumReviews);
     const realistic = latestUniqueQuestions(core.filter((attempt) =>
-      bank.find((question) => question.id === attempt.questionId)?.reviewLevel === reviewGate.realisticReviewLevel)
+      questionIndex(bank).get(attempt.questionId)?.reviewLevel === reviewGate.realisticReviewLevel)
       .slice(-reviewGate.minimumRealisticReviews * 2), reviewGate.minimumRealisticReviews);
     if (reviews.length < reviewGate.minimumReviews || accuracy(reviews) < reviewGate.minimumReviewAccuracy ||
         realistic.length < reviewGate.minimumRealisticReviews ||
@@ -197,6 +229,19 @@ export function readiness(progress: Progress, bank: Question[], config: Readines
         (reviewGate.requireNoRealisticMiss && realistic.some((attempt) => attempt.finalResult === "miss"))) {
       mustDo.push({ id: "realistic-review", label: reviewGate.label });
     }
+  }
+  const dimensionPerformance: Record<string, { attempts: number; correct: number; accuracy: number }> = {};
+  for (const dimension of config.readinessDimensions ?? []) {
+    const attempts = latestUniqueQuestions(core.filter((attempt) =>
+      questionIndex(bank).get(attempt.questionId)?.readinessDimensions?.includes(dimension.id) &&
+      (!dimension.mode || questionIndex(bank).get(attempt.questionId)?.mode === dimension.mode)),
+    dimension.recentWindow);
+    const correct = attempts.filter((attempt) => attempt.finalResult === "correct").length;
+    const meetsAccuracy = accuracy(attempts) >= (dimension.minimumAccuracy ?? 0);
+    if (attempts.length < dimension.minimumQuestions || correct < dimension.minimumCorrect || !meetsAccuracy) {
+      mustDo.push({ id: `dimension-${dimension.id}`, label: `${dimension.label} (${correct}/${dimension.minimumCorrect} correct across ${attempts.length}/${dimension.minimumQuestions} distinct scenarios${dimension.minimumAccuracy ? `; aim for ${Math.round(dimension.minimumAccuracy * 100)}% recent accuracy` : ""})` });
+    }
+    dimensionPerformance[dimension.id] = { attempts: attempts.length, correct, accuracy: accuracy(attempts) };
   }
   const canDoLater = bank.filter((q) => q.mode !== "legacyConcept" && q.depth === "optional" && !progress.attempts.some((a) =>
     a.questionId === q.id && a.finalResult === "correct"));
@@ -208,6 +253,7 @@ export function readiness(progress: Progress, bank: Question[], config: Readines
     mustDo, canDoLater, warnings, coreCoverage: states.filter((s) => s.total > 0).length,
     recentAccuracy: accuracy(recent), mediumAccuracy: accuracy(medium), hardAccuracy: accuracy(hard),
     hardAttempts: hard.length, completedImplementations,
+    dimensionPerformance,
     conceptPerformance: Object.fromEntries(subjectConcepts.map((c, index) => [c, states[index]])),
   };
 }
@@ -240,8 +286,9 @@ export function reviewCard(progress: Progress, questionId: string, successful: b
   return { ...progress, reviews: { ...progress.reviews, [questionId]: { successful, afterAttempt: progress.attempts.length } } };
 }
 
-export function selectQuestion(bank: Question[], mode: ActiveMode | null, progress: Progress): Question | undefined {
-  const checkpoint = readiness(progress, bank);
+export function selectQuestion(bank: Question[], mode: ActiveMode | null, progress: Progress,
+  config?: ReadinessConfig): Question | undefined {
+  const checkpoint = readiness(progress, bank, config);
   const candidates = bank.filter((q) => q.mode !== "legacyConcept" && (!mode || q.mode === mode));
   const recentIds = progress.recentQuestions.length ? progress.recentQuestions.slice(-5) : progress.attempts.slice(-5).map((a) => a.questionId);
   const lastId = progress.resume?.questionId ?? progress.attempts.at(-1)?.questionId;
@@ -268,6 +315,10 @@ export function selectQuestion(bank: Question[], mode: ActiveMode | null, progre
       }
       if (ids.includes("hard") && progress.attempts.length >= 5 && q.difficulty === "hard") score += 30;
       if (ids.includes("medium") && progress.attempts.length >= 2 && q.difficulty === "medium") score += 25;
+      if (config?.readinessDimensions?.some((dimension) =>
+        ids.includes(`dimension-${dimension.id}`) &&
+        q.readinessDimensions?.includes(dimension.id) &&
+        (!dimension.mode || q.mode === dimension.mode))) score += 95;
       const total = Math.min(...q.concepts.map((c) => checkpoint.conceptPerformance[c].total));
       score += q.difficulty === (total === 0 ? "easy" : "medium") ? 10 : 0;
       if (q.mode === "reconstruction" && q.concepts.some((c) => !checkpoint.conceptPerformance[c].reconstruction)) score += 15;
@@ -302,7 +353,10 @@ export function recordAttempt(progress: Progress, question: Question, result: bo
     ...(evaluation ? { score: evaluation.score, failedFields: evaluation.failed } : {}),
   }];
   return { ...progress, attempts, session: progress.session ? {
-    ...progress.session, completed: attempts.length - progress.session.startAttempt >= progress.session.size,
+    ...progress.session,
+    completed: attempts.length - progress.session.startAttempt + (progress.session.skipped?.length ?? 0) >= progress.session.size,
+    ...(attempts.length - progress.session.startAttempt + (progress.session.skipped?.length ?? 0) >= progress.session.size
+      ? { endedAt: timestamp } : {}),
   } : null };
 }
 
@@ -314,15 +368,34 @@ export function overrideAttempt(progress: Progress, index: number, finalResult: 
   } : a) };
 }
 
-export function startSession(progress: Progress, size: 10 | 20 | 30, bank: Question[]): Progress {
+export function startSession(progress: Progress, size: number, bank: Question[],
+  config?: ReadinessConfig, startedAt = Date.now()): Progress {
+  if (!Number.isSafeInteger(size) || size < 1 || size > 30) throw new Error("Session size must be between 1 and 30.");
   return { ...progress, resume: null, session: { size, startAttempt: progress.attempts.length,
-    initialMustDo: readiness(progress, bank).mustDo.map((gap) => gap.id),
-    initialCards: weaknessCards(progress, bank).map((q) => q.id), completed: false } };
+    initialMustDo: readiness(progress, bank, config).mustDo.map((gap) => gap.id),
+    initialCards: weaknessCards(progress, bank).map((q) => q.id), completed: false, startedAt, skipped: [] } };
 }
 
-export function sessionSummary(progress: Progress, bank: Question[]) {
+export function endSession(progress: Progress, endedAt = Date.now()): Progress {
+  if (!progress.session) return progress;
+  return { ...progress, session: { ...progress.session, completed: true, endedAt } };
+}
+
+export function skipQuestion(progress: Progress, questionId: string, timestamp = Date.now()): Progress {
+  if (!progress.session || progress.session.completed) throw new Error("Cannot skip outside an active session.");
+  const skipped = [...(progress.session.skipped ?? []), questionId];
+  const completed = progress.attempts.length - progress.session.startAttempt + skipped.length >= progress.session.size;
+  return { ...progress, resume: null, session: { ...progress.session, skipped, completed,
+    ...(completed ? { endedAt: timestamp } : {}) } };
+}
+
+export function sessionElapsed(startedAt: number | undefined, now: number, endedAt?: number) {
+  return startedAt === undefined ? 0 : Math.max(0, Math.floor(((endedAt ?? now) - startedAt) / 1000));
+}
+
+export function sessionSummary(progress: Progress, bank: Question[], config?: ReadinessConfig) {
   if (!progress.session) return null;
-  const checkpoint = readiness(progress, bank);
+  const checkpoint = readiness(progress, bank, config);
   return {
     completed: progress.session.completed,
     questions: progress.attempts.length - progress.session.startAttempt,
@@ -330,5 +403,9 @@ export function sessionSummary(progress: Progress, bank: Question[]) {
     remaining: checkpoint.mustDo.length,
     newWeaknesses: weaknessCards(progress, bank).filter((q) => !progress.session!.initialCards.includes(q.id)).length,
     status: checkpoint.status,
+    correct: progress.attempts.slice(progress.session.startAttempt).filter((a) => a.finalResult === "correct").length,
+    missed: progress.attempts.slice(progress.session.startAttempt).filter((a) => a.finalResult !== "correct").length,
+    skipped: progress.session.skipped?.length ?? 0,
+    elapsed: sessionElapsed(progress.session.startedAt, Date.now(), progress.session.endedAt),
   };
 }

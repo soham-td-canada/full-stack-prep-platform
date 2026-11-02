@@ -294,7 +294,7 @@ describe("React progress, weakness and readiness", () => {
     expect(local.getItem(STORAGE_KEY)).toBe(before);
     expect(loadProgress(local)).toEqual(js);
     expect(readiness(js, questions).status).toBe("READY TO MOVE ON");
-    expect(() => loadProgress(local, REACT_STORAGE_KEY, questions)).toThrow("question bank");
+    expect(loadProgress(local, REACT_STORAGE_KEY, questions).attempts).toEqual(react.attempts);
   });
   it("protects corrupt React data and resets only the selected module", () => {
     const local = storage();

@@ -1,16 +1,19 @@
 "use client";
 
-import { useEffect, useRef, useState, useSyncExternalStore, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type FormEvent } from "react";
 import Link from "next/link";
 import StructuredAnswer from "./structured-answer";
 import { evaluateStructured, structuredComplete } from "@/lib/structured";
 import {
-  checkOutput, readiness, recordAttempt,
-  reviewCard, selectQuestion, sessionSummary, startSession, weaknessCards,
+  checkOutput, endSession, readiness, recordAttempt,
+  reviewCard, selectQuestion, sessionSummary, skipQuestion, startSession, weaknessCards,
 } from "@/lib/learning";
 import { allConcepts, allModes, emptyProgress, type ActiveMode, type ModuleId, type Attempt, type Concept, type Progress, type Question, type Result } from "@/lib/model";
 import { moduleRegistry } from "@/lib/modules";
-import { progressStores as stores } from "@/lib/progress-stores";
+import { moduleProgressStore, progressStores as stores } from "@/lib/progress-stores";
+import { calculateRequiredWork, selectRequiredQuestion, sessionPresets } from "@/lib/required-work";
+import { formatElapsed, ModeProgressCard, RequiredCount, SessionHeader, StatusBadge } from "./progress-ui";
+import { configuredModules } from "@/lib/modules";
 
 function Code({ children }: { children: string }) {
   return <pre tabIndex={0} className="overflow-x-auto border border-gray-300 bg-gray-50 p-5 text-base leading-7"><code>{children}</code></pre>;
@@ -19,16 +22,16 @@ function Code({ children }: { children: string }) {
 export default function DrillApp({ moduleId = "javascript-typescript" }: { moduleId?: ModuleId }) {
   const store = stores[moduleId];
   const trainingModule = moduleRegistry[moduleId];
-  const { questions, modes, concepts } = trainingModule;
+  const { questions, concepts } = trainingModule;
   const { progress, loaded, error } = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getServerSnapshot);
   const [mode, setMode] = useState<ActiveMode | null>(null);
   const [question, setQuestion] = useState<Question | null>(null);
-  const [sessionSize, setSessionSize] = useState<10 | 20 | 30>(10);
   const [reviewing, setReviewing] = useState(false);
   const [reviewIndex, setReviewIndex] = useState(0);
   const [cardRevealed, setCardRevealed] = useState(false);
   const [reviewAnswer, setReviewAnswer] = useState("");
-  const cards = weaknessCards(progress, questions);
+  const [sessionConflict, setSessionConflict] = useState(false);
+  const cards = useMemo(() => weaknessCards(progress, questions), [progress, questions]);
   const activeCard = cards[reviewIndex];
   const lastMistake = progress.attempts.findLast((a) => a.questionId === activeCard?.id && a.finalResult !== "correct");
   const cardField = activeCard?.structured?.fields.find((field) => field.misconceptionTag && lastMistake?.mistakeTags.includes(field.misconceptionTag))
@@ -37,11 +40,19 @@ export default function DrillApp({ moduleId = "javascript-typescript" }: { modul
   const structuredCard: Question | undefined = activeCard?.structured && cardField
     ? { ...activeCard, structured: { ...activeCard.structured, fields: [cardField] } } : undefined;
   const reviewComplete = structuredCard ? structuredComplete(structuredCard, reviewAnswer) : !!reviewAnswer.trim();
-  const checkpoint = readiness(progress, questions, trainingModule.readinessConfig);
-  const summary = sessionSummary(progress, questions);
+  const checkpoint = useMemo(() => readiness(progress, questions, trainingModule.readinessConfig),
+    [progress, questions, trainingModule]);
+  const work = loaded ? calculateRequiredWork(progress, trainingModule) : null;
+  const sessionSize = progress.selectedSessionSize;
+  const summary = sessionSummary(progress, questions, trainingModule.readinessConfig);
   useEffect(() => { store.hydrate(); }, [store]);
 
   function open(next: Question, selectedMode: ActiveMode | null, current: Progress) {
+    if (current.session && !current.session.completed && current.resume?.attemptIndex === null &&
+      current.resume.questionId !== next.id) {
+      setSessionConflict(true);
+      return;
+    }
     setMode(selectedMode);
     setQuestion(next);
     setReviewing(false);
@@ -50,9 +61,28 @@ export default function DrillApp({ moduleId = "javascript-typescript" }: { modul
   }
   function start(selectedMode: ActiveMode | null) {
     const current = store.getSnapshot().progress;
-    const session = !current.session || current.session.completed ? startSession(current, sessionSize, questions) : current;
-    const next = selectQuestion(questions, selectedMode, session);
-    if (!next) throw new Error(`No questions available for ${selectedMode ?? "must-do practice"}.`);
+    if (current.session && !current.session.completed && current.resume?.attemptIndex === null) {
+      setSessionConflict(true);
+      return;
+    }
+    const modeWork = work?.modes.find((m) => m.mode === selectedMode);
+    const focus = (!selectedMode || modeWork?.requiredRemaining) && work?.totalRequiredRemaining ? "required" : "optional";
+    const presets = sessionPresets(trainingModule, selectedMode);
+    const size = !selectedMode || presets.includes(sessionSize) ? sessionSize : presets[Math.floor(presets.length / 2)];
+    const isNewSession = !current.session || current.session.completed;
+    let session = isNewSession
+      ? startSession(current, size, questions, trainingModule.readinessConfig) : current;
+    session = { ...session, session: session.session ? { ...session.session,
+      mode: selectedMode, focus, ...(isNewSession ? { initialRequired: work?.totalRequiredRemaining } : {}) } : null };
+    const next = focus === "required" ? selectedMode
+      ? selectQuestion(questions, selectedMode, session, trainingModule.readinessConfig)
+      : selectRequiredQuestion(session, trainingModule) :
+      selectQuestion(questions.filter((q) => !session.attempts.some((a) => a.questionId === q.id)), selectedMode, session, trainingModule.readinessConfig);
+    if (!next) {
+      store.update(endSession(session));
+      home();
+      return;
+    }
     open(next, selectedMode, session);
   }
   function nextQuestion() {
@@ -61,32 +91,37 @@ export default function DrillApp({ moduleId = "javascript-typescript" }: { modul
       home();
       return;
     }
-    const next = selectQuestion(questions, mode, current);
-    if (!next) throw new Error("No next question available.");
+    const next = current.session?.focus === "required" ? selectRequiredQuestion(current, trainingModule, mode) :
+      selectQuestion(questions.filter((q) => !current.attempts.some((a) => a.questionId === q.id)), mode, current, trainingModule.readinessConfig);
+    if (!next) {
+      store.update(endSession(current));
+      home();
+      return;
+    }
     open(next, mode, current);
   }
   function home() {
     setMode(null);
     setQuestion(null);
     setReviewing(false);
+    setSessionConflict(false);
   }
   function resume() {
+    setSessionConflict(false);
     const saved = progress.resume;
     const last = questions.find((q) => q.id === saved?.questionId);
     if (!last || (progress.session?.completed && saved?.attemptIndex === null)) {
       start(null);
       return;
     }
-    setMode(saved?.practiceMode === undefined || saved.practiceMode === null
+    setMode(saved?.practiceMode === null ? null : saved?.practiceMode === undefined
       ? last.mode === "legacyConcept" ? "reconstruction" : last.mode
       : saved.practiceMode === "legacyConcept" ? "reconstruction" : saved.practiceMode);
     setQuestion(last);
     setReviewing(false);
   }
   function continueMustDo() {
-    const last = questions.find((q) => q.id === progress.resume?.questionId);
-    if (last?.depth === "core" && progress.resume?.attemptIndex === null && !progress.session?.completed &&
-        checkpoint.mustDo.some((gap) => gap.concept && last.concepts.includes(gap.concept))) resume();
+    if (progress.resume && progress.session?.focus === "required" && !progress.session.completed) resume();
     else start(null);
   }
   const saved = question?.id === progress.resume?.questionId ? progress.resume : null;
@@ -96,10 +131,19 @@ export default function DrillApp({ moduleId = "javascript-typescript" }: { modul
     <div className="space-y-8">
       {error && <p role="alert" className="border border-black p-4 text-sm">{error}</p>}
       {!loaded ? <p role="status">Loading local progress...</p> : question ? (
+        <div className="space-y-4">
+        {progress.session && <SessionHeader title={trainingModule.shortTitle}
+          mode={question.mode === "legacyConcept" ? "reconstruction" : question.mode}
+          required={work!.totalRequiredRemaining} session={progress.session} answered={summary?.questions ?? 0} graded={!!attempt} />}
         <Training key={question.id} question={question} saved={saved} attempt={attempt}
-          sessionLabel={`${summary?.questions ?? 0} / ${progress.session?.size ?? sessionSize} questions`}
           sessionComplete={progress.session?.completed ?? false}
           onHome={home} onNext={nextQuestion}
+          onEnd={() => { store.update(endSession(store.getSnapshot().progress)); home(); }}
+          onSkip={() => {
+            const current = skipQuestion(store.getSnapshot().progress, question.id);
+            store.update(current);
+            nextQuestion();
+          }}
           onDraft={(answer, revealed) => {
             const current = store.getSnapshot().progress;
             store.update({ ...current, resume: { questionId: question.id, answer, revealed, attemptIndex: current.resume?.attemptIndex ?? null, practiceMode: mode } });
@@ -110,7 +154,7 @@ export default function DrillApp({ moduleId = "javascript-typescript" }: { modul
             const updated = recordAttempt(current, question, finalResult, Date.now(), answer, autoResult);
             store.update({ ...updated, resume: { questionId: question.id, answer, revealed: true, attemptIndex: updated.attempts.length - 1, practiceMode: mode } });
           }}
-          />
+          /></div>
       ) : reviewing ? (
         <section className="space-y-5" aria-labelledby="review-heading">
           <button onClick={home}>Back to dashboard</button>
@@ -142,41 +186,80 @@ export default function DrillApp({ moduleId = "javascript-typescript" }: { modul
         </section>
       ) : (
         <>
-          <ModuleDashboard selected={moduleId} />
+          <section className="module-overview surface space-y-3 p-5" aria-label="Module required work">
+            <RequiredCount count={work!.totalRequiredRemaining} />
+            <StatusBadge ready={work!.status === "READY TO MOVE ON"}>{work!.status}</StatusBadge>
+            <p>{work!.mustDoAreas} MUST-DO AREAS · <span className="secondary">{work!.optional} optional unseen questions</span></p>
+            {work!.status === "READY TO MOVE ON" && <><p>Core interview requirements demonstrated.</p><p>Recommended next step: Move to the next interview topic.</p></>}
+            <details className="text-sm secondary"><summary>About required questions</summary>
+              <p>Required questions are a deterministic practice plan for your remaining must-do requirements, assuming successful validation. One question may clear multiple requirements. This is an achievable estimate, not a guaranteed shortest path. The number can change if new weaknesses are discovered. Skips and flashcards do not clear requirements.</p>
+            </details>
+          </section>
+          {sessionConflict && <section className="surface space-y-3 p-4" aria-labelledby="session-conflict-heading">
+            <h2 id="session-conflict-heading" className="font-semibold">Session already in progress</h2>
+            <p>Your unfinished answer is saved. Resume this session or end it before starting a different practice session.</p>
+            <button className="primary" onClick={resume}>Resume active session</button>
+            <button onClick={() => { store.update(endSession(progress)); home(); }}>End current session</button>
+          </section>}
           {summary?.completed && <section className="space-y-2 border border-black p-5" aria-labelledby="session-heading">
             <h2 id="session-heading" className="text-xl font-bold">SESSION COMPLETE</h2>
             <p>Questions completed: {summary.questions}</p>
+            <p>{summary.correct} correct · {summary.missed} missed / retry · {summary.skipped} skipped</p>
+            <p>Elapsed: {progress.session?.startedAt === undefined ? "Not recorded in this older session" : formatElapsed(summary.elapsed)}</p>
             <p>Must-do gaps resolved: {summary.resolved} / Remaining: {summary.remaining}</p>
             <p>New weaknesses detected: {summary.newWeaknesses}</p>
-            <p>Current status: {summary.status}</p>
-            <p>Recommended next action: {summary.status === "READY TO MOVE ON" ? "Move to the next interview topic." : "Complete remaining MUST DO items when you return."}</p>
+            {checkpoint.mustDo.some((gap) => !progress.session?.initialMustDo.includes(gap.id)) && <p className="secondary">
+              New must-do evidence: {checkpoint.mustDo.filter((gap) => !progress.session?.initialMustDo.includes(gap.id)).map((gap) => gap.label).join(" · ")}
+            </p>}
+            <p>REQUIRED WORK — Before: {progress.session?.initialRequired ?? "Not recorded in this older session"} · Now: {work!.totalRequiredRemaining}</p>
+            {progress.session?.initialRequired !== undefined && <p>{work!.totalRequiredRemaining - progress.session.initialRequired > 0 ? "+" : ""}{work!.totalRequiredRemaining - progress.session.initialRequired} required change
+              {work!.totalRequiredRemaining > progress.session.initialRequired && " — New validation work was identified. This is useful evidence, not a penalty."}</p>}
+            <p>Recommended next: {work!.priority[0] ? `${allModes[work!.priority[0].mode]} — ${work!.priority[0].requiredRemaining} required` : "Move to the next interview topic."}</p>
+            {work!.totalRequiredRemaining > 0 && <button className="primary" onClick={() => {
+              store.update({ ...progress, session: null, resume: null }); start(null);
+            }}>Continue another session</button>}
+            <button onClick={() => { store.update({ ...progress, session: null, resume: null }); home(); }}>Stop for now</button>
           </section>}
           <section className="space-y-3 border border-gray-300 p-5" aria-labelledby="continue-heading">
-            <h2 id="continue-heading" className="font-bold">CONTINUE</h2>
+            <h2 id="continue-heading" className="font-bold">{work!.status === "READY TO MOVE ON" ? "NEXT MODULE" : "CONTINUE"}</h2>
             <p>Last session: {progress.resume ? `${questions.find((q) => q.id === progress.resume?.questionId)?.concepts.map((c) => allConcepts[c]).join(" / ")} / ${allModes[questions.find((q) => q.id === progress.resume?.questionId)!.mode]}` : "Not started"}</p>
-            <p>Current MUST DO: {checkpoint.mustDo.length} / Overall status: {checkpoint.status}</p>
-            {checkpoint.mustDo.length > 0 ? <button onClick={continueMustDo}>{moduleId === "react" ? "Continue React Must-Do" : "Continue Must-Do Practice"}</button>
-              : <p className="font-bold">Recommended next step: Move to the next interview topic.</p>}
-            {progress.resume && <button onClick={resume}>Resume saved question</button>}
-            <label className="block" htmlFor="session-size">Optional session limit</label>
+            <p>Current MUST DO: {work!.mustDoAreas} / Overall status: {work!.status}</p>
+            {checkpoint.mustDo.length > 0 ? <button className="primary" onClick={continueMustDo}>{moduleId === "javascript-typescript" ? "Continue Must-Do Practice" : `Continue ${trainingModule.shortTitle} Must-Do`}</button>
+              : <NextModule selected={moduleId} />}
+            {progress.resume && (!progress.session?.completed || progress.resume.attemptIndex !== null) &&
+              <button aria-label="Resume saved question" onClick={resume}>{progress.session && !progress.session.completed ? "Resume Session" : "Review saved answer"}</button>}
+            <label className="block" htmlFor="session-size">Session size (next session)</label>
             <select id="session-size" value={sessionSize} onChange={(e) => {
               const size = Number(e.target.value);
-              if (size === 10 || size === 20 || size === 30) setSessionSize(size);
+              store.update({ ...progress, selectedSessionSize: size });
             }}>
-              {[10, 20, 30].map((size) => <option key={size} value={size}>{size} questions</option>)}
+              {[1, 3, 5, 10, 20].map((size) => <option key={size} value={size}>{size} {size < 5 ? "deep exercises" : "questions"}</option>)}
             </select>
             {progress.session && !progress.session.completed && <p>Active session: {summary?.questions} / {progress.session.size} questions. The selected limit applies to your next session.</p>}
+            {progress.session && !progress.session.completed && <button onClick={() => { store.update(endSession(progress)); home(); }}>End Session</button>}
+            <p className="secondary text-sm">Must-do: roughly 2–3 min per standard question. Review / architecture: 1, 3 or 5 exercises, roughly 8–15 min each. Pacing is guidance only.</p>
           </section>
+          <section className="space-y-3" aria-labelledby="must-do-next">
+            <h2 id="must-do-next" className="text-lg font-bold">MUST DO NEXT</h2>
+            {work!.priority.length ? <ol className="must-do-list">{work!.priority.map((m) =>
+              <li key={m.mode}><button onClick={() => start(m.mode)}>{allModes[m.mode]} — {m.requiredRemaining} required</button></li>)}</ol> :
+              <p>Required work is done. Optional practice can safely wait.</p>}
+            <p className="secondary text-sm">DONE / OPTIONAL: {work!.modes.filter((m) => !m.requiredRemaining).map((m) => `✓ ${allModes[m.mode]}`).join(" · ") || "No modes cleared yet"}</p>
+          </section>
+          <h2 className="text-lg font-bold">MODE PROGRESS</h2>
           <nav aria-label="Training modes" className="grid gap-3 sm:grid-cols-2">
-            {(Object.keys(modes) as ActiveMode[]).map((key) => <button key={key} onClick={() => start(key)}
-              className="min-h-20 text-left text-xl">{allModes[key]}{!checkpoint.mustDo.length && <span className="block text-sm">Optional extra practice</span>}</button>)}
+            {work!.modes.map((m) => <ModeProgressCard key={m.mode} work={m} onStart={() => start(m.mode)}
+              presets={sessionPresets(trainingModule, m.mode)} selectedSize={sessionSize}
+              onSizeChange={(size) => store.update({ ...progress, selectedSessionSize: size })} />)}
           </nav>
           <section className="space-y-4" aria-labelledby="readiness-heading">
-            <h2 id="readiness-heading" className="text-xl font-bold">{moduleId === "react" ? "REACT READINESS" : "JS / TS READINESS"}</h2>
-            <strong>{checkpoint.status}</strong>
-            <p>Must-do: {checkpoint.mustDo.length} / Core coverage: {checkpoint.coreCoverage} / 10</p>
-            <p>Recent core score: {Math.round(checkpoint.recentAccuracy * 100)}% / Medium: {Math.round(checkpoint.mediumAccuracy * 100)}% / Hard: {Math.round(checkpoint.hardAccuracy * 100)}% ({checkpoint.hardAttempts} recent attempts)</p>
-            <p className="text-sm text-gray-600">Three distinct core questions per area, structured reconstruction and practical success, 82% recent core score, 80% medium accuracy, hard/debug exposure, and required core implementations or reviews. Optional depth and flashcard scores never substitute for game evidence. Repeated critical misconceptions block readiness. Practice verbal explanations separately.</p>
+            <h2 id="readiness-heading" className="text-xl font-bold">{moduleId === "javascript-typescript" ? "JS / TS" : trainingModule.title.toUpperCase()} READINESS</h2>
+            <strong>{work!.status}</strong>
+            {trainingModule.frameworkVersion && <p className="text-sm secondary">Question context: {trainingModule.frameworkVersion}. {trainingModule.versionNotes}</p>}
+            <p>Must-do: {checkpoint.mustDo.length} / Core coverage: {checkpoint.coreCoverage} / {trainingModule.readinessConfig.concepts.length}</p>
+            <details className="secondary text-sm"><summary>Secondary readiness statistics</summary><p>Recent core score: {Math.round(checkpoint.recentAccuracy * 100)}% / Medium: {Math.round(checkpoint.mediumAccuracy * 100)}% / Hard: {Math.round(checkpoint.hardAccuracy * 100)}% ({checkpoint.hardAttempts} recent attempts)</p></details>
+            <p className="text-sm text-gray-600">Readiness uses distinct core questions, reconstruction and practical success, consistent medium evidence, and hard/debug exposure under this module&apos;s configured requirements. Optional depth and flashcard scores never substitute for practice evidence. Repeated core misconceptions block readiness. Practice verbal explanations separately.</p>
+            {Object.entries(checkpoint.dimensionPerformance ?? {}).length > 0 && <p className="text-sm">Architecture evidence: {Object.entries(checkpoint.dimensionPerformance).map(([id, value]) => `${id} ${value.correct} correct / ${value.attempts} attempted`).join(" · ")}</p>}
             <h3 className="font-bold">MUST DO - Core interview gaps</h3>
             {checkpoint.mustDo.length ? <ul className="space-y-2">{checkpoint.mustDo.map((gap) => <li key={gap.id}>{gap.label}</li>)}</ul>
               : <p>No unresolved must-do gaps. Continued drilling has lower value than studying another interview area.</p>}
@@ -199,12 +282,17 @@ export default function DrillApp({ moduleId = "javascript-typescript" }: { modul
               <p className="my-2 text-sm">Extra variants and advanced detail are optional, not prerequisites.</p>
               <ul className="space-y-2">{checkpoint.canDoLater.map((q) => <li key={q.id}>
                 <button className="text-left" onClick={() => {
-                  const current = !progress.session || progress.session.completed ? startSession(progress, sessionSize, questions) : progress;
+                  const current = !progress.session || progress.session.completed
+                    ? startSession(progress, sessionSize, questions, trainingModule.readinessConfig) : progress;
                   open(q, null, current);
                 }}>{q.prompt}</button>
               </li>)}</ul>
             </details>
             {checkpoint.warnings.map((warning) => <p key={warning} className="border-l-2 border-gray-400 pl-4 text-sm">{warning}</p>)}
+            <details className="secondary text-sm"><summary>Question bank — optional variety, not the finish line</summary>
+              <p>Available: {work!.modes.reduce((s, m) => s + m.available, 0)} · Attempted: {work!.modes.reduce((s, m) => s + m.attempted, 0)} · Unseen: {work!.modes.reduce((s, m) => s + m.unseen, 0)} · Optional unseen: {work!.optional}</p>
+              <p>You do not need to complete every available question.</p>
+            </details>
           </section>
           {cards.length > 0 && <section className="space-y-3 border border-black p-5" aria-labelledby="weakness-heading">
             <h2 id="weakness-heading" className="font-bold">WEAKNESS REVIEW</h2>
@@ -232,43 +320,31 @@ export default function DrillApp({ moduleId = "javascript-typescript" }: { modul
   );
 }
 
-function ModuleDashboard({ selected }: { selected: ModuleId }) {
+function NextModule({ selected }: { selected: ModuleId }) {
   useEffect(() => { Object.values(stores).forEach((store) => store.hydrate()); }, []);
-  return <nav aria-label="Interview modules" className="grid gap-3 sm:grid-cols-2">
-    {Object.values(moduleRegistry).map((trainingModule) => <ModuleCard key={trainingModule.id} trainingModule={trainingModule} selected={selected} />)}
-  </nav>;
+  const snapshots = useSyncExternalStore(moduleProgressStore.subscribe, moduleProgressStore.getSnapshot, moduleProgressStore.getServerSnapshot);
+  const ordered = [...configuredModules.slice(configuredModules.findIndex((m) => m.id === selected) + 1),
+    ...configuredModules.slice(0, configuredModules.findIndex((m) => m.id === selected))];
+  const target = ordered.find((m) => {
+    const snapshot = snapshots[configuredModules.findIndex((configured) => configured.id === m.id)];
+    return snapshot.loaded && readiness(snapshot.progress, m.questions, m.readinessConfig).mustDo.length > 0;
+  });
+  if (snapshots.some((snapshot) => !snapshot.loaded)) return <p>Finding the next configured module...</p>;
+  return target ? <p>Next: {target.title} <Link className="action-link" href={target.path}>Move to next module</Link></p> :
+    <p className="secondary">All configured modules are ready. Optional review can wait.</p>;
 }
 
-function ModuleCard({ trainingModule, selected }: {
-  trainingModule: (typeof moduleRegistry)[ModuleId];
-  selected: ModuleId;
-}) {
-  const store = stores[trainingModule.id];
-  const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getServerSnapshot);
-  const state = readiness(snapshot.progress, trainingModule.questions, trainingModule.readinessConfig);
-  const weak = Object.entries(state.conceptPerformance).filter(([, value]) => value.status === "Weak");
-  const resume = trainingModule.questions.find((q) => q.id === snapshot.progress.resume?.questionId);
-  return <div className="space-y-2 border border-gray-300 p-4">
-    <Link href={trainingModule.path} className="font-bold underline">{trainingModule.title}</Link>
-    <p>{snapshot.loaded ? state.status === "READY TO MOVE ON" ? state.status : "IN PROGRESS" : "Loading..."}</p>
-    <p>MUST DO: {state.mustDo.length} remaining / CAN DO LATER: {state.canDoLater.length}</p>
-    <p>Recent core performance: {state.coreCoverage ? `${Math.round(state.recentAccuracy * 100)}%` : "--"}</p>
-    <p>Resume point: {resume ? resume.concepts.map((id) => allConcepts[id]).join(" / ") : "Not started"}</p>
-    {weak.length > 0 && <p>Weak areas: {weak.map(([id]) => allConcepts[id as Concept]).join(", ")}</p>}
-    {snapshot.error && trainingModule.id !== selected && <p role="alert">{trainingModule.title}: {snapshot.error}</p>}
-  </div>;
-}
-
-function Training({ question, saved, attempt, sessionLabel, sessionComplete, onGrade, onDraft, onNext, onHome }: {
+function Training({ question, saved, attempt, sessionComplete, onGrade, onDraft, onNext, onHome, onEnd, onSkip }: {
   question: Question;
   saved: Progress["resume"];
   attempt?: Attempt;
-  sessionLabel: string;
   sessionComplete: boolean;
   onGrade: (result: Result, answer: string, autoResult: Result | null) => void;
   onDraft: (answer: string, revealed: boolean) => void;
   onNext: () => void;
   onHome: () => void;
+  onEnd: () => void;
+  onSkip: () => void;
 }) {
   const [answer, setAnswer] = useState(saved?.answer ?? "");
   const [revealed, setRevealed] = useState(saved?.revealed ?? false);
@@ -320,12 +396,17 @@ function Training({ question, saved, attempt, sessionLabel, sessionComplete, onG
   }
 
   return <section className="space-y-5" aria-labelledby="question-heading">
-    <button onClick={() => {
+    <div className="flex flex-wrap gap-2"><button onClick={() => {
       saveDraftNow(answer, revealed);
       onHome();
     }}>Back to dashboard</button>
+    <button className="secondary-action" onClick={() => { saveDraftNow(answer, revealed); onEnd(); }}>End Session</button>
+    {!attempt && <button className="secondary-action" onClick={onSkip}>Skip question</button>}</div>
     <p className="text-sm uppercase tracking-wide">{allModes[question.mode]} / {question.difficulty} / {question.depth === "core" ? "CORE INTERVIEW PRACTICE" : "OPTIONAL DEPTH"}</p>
-    <p>{sessionLabel}</p>
+    {question.frameworkVersion && <p className="text-sm text-gray-600">Framework context: {question.frameworkVersion}{question.versionSensitive ? " · version-sensitive" : ""}</p>}
+    {question.versionNotes && <p className="text-sm text-gray-600">{question.versionNotes}</p>}
+    <p className="secondary text-sm">Suggested pacing: {question.mode === "codeReview" || question.mode === "architecture" ? "~8–15 min" :
+      question.difficulty === "hard" || question.mode === "implement" ? "~4–6 min" : "~2–3 min"}. Guidance only.</p>
     <h2 ref={heading} tabIndex={-1} id="question-heading" className="text-2xl font-semibold">{question.prompt}</h2>
     <p className="text-sm text-gray-600">{question.concepts.map((c) => allConcepts[c]).join(" / ")}</p>
     {question.code && <Code>{question.mode === "codeReview" ? question.code.split("\n").map((line, i) => `${String(i + 1).padStart(3)} | ${line}`).join("\n") : question.code}</Code>}

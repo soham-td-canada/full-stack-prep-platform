@@ -23,7 +23,19 @@ export const reactConcepts = {
   reactDesign: "19. Composition / Component APIs",
   reactReview: "20. Code Review / Refactor",
 } as const;
-export const allConcepts = { ...concepts, ...reactConcepts };
+export const nextConcepts = {
+  nextRouting: "21. App Router Structure",
+  nextBoundaries: "22. Server / Client Components",
+  nextDataFetching: "23. Data Fetching",
+  nextRendering: "24. Rendering Strategies",
+  nextCaching: "25. Caching / Revalidation",
+  nextPdp: "26. PDP Freshness Architecture",
+  nextDataBoundaries: "27. Server Data / Route / Action",
+  nextMutations: "28. Mutations",
+  nextArchitecture: "29. Large-App Architecture / Monorepos",
+  nextPerformance: "30. Performance Diagnosis",
+} as const;
+export const allConcepts = { ...concepts, ...reactConcepts, ...nextConcepts };
 export type Concept = keyof typeof allConcepts;
 export const modes = {
   prints: "What Prints?",
@@ -37,15 +49,43 @@ export const reactModes = {
   debug: "Debug It",
   codeReview: "Code Review / Refactor",
 } as const;
+export const nextModes = {
+  prediction: "Predict It",
+  reconstruction: "Concept Reconstruction",
+  debug: "Debug It",
+  architecture: "Architecture & Diagnosis",
+} as const;
 export const legacyModes = { legacyConcept: "Archived concept question" } as const;
-export const allModes = { ...modes, ...reactModes, ...legacyModes };
+export const allModes = { ...modes, ...reactModes, ...nextModes, ...legacyModes };
 export type Mode = keyof typeof allModes;
-export type ActiveMode = keyof typeof modes | keyof typeof reactModes;
-export type ModuleId = "javascript-typescript" | "react";
+export type ActiveMode = keyof typeof modes | keyof typeof reactModes | keyof typeof nextModes;
+export type ModuleId = "javascript-typescript" | "react" | "nextjs-frontend-architecture";
 export interface ReadinessConfig {
   concepts: Concept[];
   conceptualMode: ActiveMode;
   requiredImplementationGroups: string[];
+  practiceThresholds?: {
+    minimumCoreQuestions: number;
+    recentCoreWindow: number;
+    minimumRecentAccuracy: number;
+    minimumMediumQuestions: number;
+    minimumMediumDistinct: number;
+    minimumMediumAccuracy: number;
+    minimumHardQuestions: number;
+    minimumHardDistinct: number;
+    minimumDebugQuestions: number;
+    minimumDebugDistinct: number;
+    minimumDebugAccuracy: number;
+  };
+  readinessDimensions?: {
+    id: string;
+    label: string;
+    minimumQuestions: number;
+    minimumCorrect: number;
+    mode?: ActiveMode;
+    recentWindow?: number;
+    minimumAccuracy?: number;
+  }[];
   reviewGate?: {
     mode: ActiveMode;
     realisticReviewLevel: number;
@@ -75,6 +115,10 @@ export interface Question {
   misconception: { prompt: string; answer: string };
   structured?: StructuredQuestion;
   reviewLevel?: 1 | 2 | 3;
+  frameworkVersion?: string;
+  versionSensitive?: boolean;
+  versionNotes?: string;
+  readinessDimensions?: string[];
 }
 
 export type QuestionType = "prediction" | "matching" | "multiBlank" | "completeSentence" | "conceptInference" |
@@ -113,19 +157,30 @@ export interface Attempt {
   failedFields?: string[];
 }
 
+export const PROGRESS_SCHEMA_VERSION = 6 as const;
 export interface Progress {
+  schemaVersion: typeof PROGRESS_SCHEMA_VERSION;
   version: 4;
   attempts: Attempt[];
   recentQuestions: string[];
+  selectedSessionSize: number;
   reviews: Record<string, { successful: boolean; afterAttempt: number }>;
   resume: { questionId: string; answer: string; revealed: boolean; attemptIndex: number | null; practiceMode?: Mode | null } | null;
   session: {
-    size: 10 | 20 | 30;
+    size: number;
     startAttempt: number;
     initialMustDo: string[];
     initialCards: string[];
     completed: boolean;
+    startedAt?: number;
+    endedAt?: number;
+    initialRequired?: number;
+    mode?: ActiveMode | null;
+    focus?: "required" | "optional";
+    skipped?: string[];
   } | null;
 }
 
-export const emptyProgress = (): Progress => ({ version: 4, attempts: [], recentQuestions: [], reviews: {}, resume: null, session: null });
+export const emptyProgress = (): Progress => ({
+  schemaVersion: PROGRESS_SCHEMA_VERSION, version: 4, attempts: [], recentQuestions: [], selectedSessionSize: 10, reviews: {}, resume: null, session: null,
+});

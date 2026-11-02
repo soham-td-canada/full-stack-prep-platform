@@ -11,7 +11,9 @@ test("root shows only configured module dashboards", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "INTERVIEW DRILL" })).toBeVisible();
   await expect(page.getByRole("link", { name: "JavaScript / TypeScript" })).toHaveAttribute("href", "/modules/javascript-typescript");
   await expect(page.getByRole("link", { name: "React" })).toHaveAttribute("href", "/modules/react");
-  await expect(page.getByText("2 modules configured")).toBeVisible();
+  await expect(page.getByRole("link", { name: "Next.js + Frontend Architecture" }))
+    .toHaveAttribute("href", "/modules/nextjs-frontend-architecture");
+  await expect(page.getByText("3 modules configured")).toBeVisible();
 });
 
 test("prediction, feedback, persistence and different next-question flow", async ({ page }) => {
@@ -103,7 +105,7 @@ test("reaches READY TO MOVE ON with optional work remaining and without perfect 
   progress.resume = { questionId: guard.id, answer: "", revealed: false, attemptIndex: null };
   await page.evaluate(({ key, progress }) => localStorage.setItem(key, JSON.stringify(progress)), { key: storageKey, progress });
   await page.reload();
-  await expect(page.getByText("Complete one TypeScript runtime guard", { exact: true })).toBeVisible();
+  await expect(page.getByRole("region", { name: "JS / TS READINESS" }).getByText("Complete one TypeScript runtime guard", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Resume saved question" }).click();
   await page.getByLabel("Your answer", { exact: true }).fill(guard.reference!);
   await page.getByRole("button", { name: "Submit answer" }).click();
